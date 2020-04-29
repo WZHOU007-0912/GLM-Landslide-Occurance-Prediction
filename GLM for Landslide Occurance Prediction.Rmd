@@ -17,12 +17,22 @@ library(pROC)
 library(plotrix)
 library(PRROC)
 library(gridExtra)
+library(raster)
+library(sp)
+options(scipen = 999)
+library(PerformanceAnalytics)
+library(kableExtra)
+library(wesanderson)
+library(ggpubr) 
+library(grid)
+library(scales)
 ```
 
 ```{r}
 landslide.train=read.csv("landslide_training_data.csv",header = T)
 landslide.validation=read.csv("landslide_validation_data.csv",header = T)
 landslide.test=read.csv("landslide_test_data.csv",header = T)
+load(file = "landslide_raster_stack")
 ```
 
 # 1. Data Exploration and tidying  
@@ -363,7 +373,7 @@ train.log10_carea.plot <-
   theme_bw()
 
 zscore.log10_carea.plot <- 
-  ggplot(data=tran.log10_carea, aes(x = train,fill = ID)) + 
+  ggplot(data=tran.log10_carea, aes(x = zscore,fill = ID)) + 
   geom_histogram(bins=40,colour = "black", position = "stack") +
   ggtitle("Log10_carea Zscore Data") +
   scale_fill_brewer(palette = "Set1")+
@@ -518,7 +528,8 @@ print("Model accuracy = correct prediction/all prediction = 76%")
 fit.new.model.train = glm(formula = lslpts ~ slope + cplan + cprof, 
                           family = binomial('logit'),
                           data = new.model.train)
-pred.landslide.new = predict(fit.new.model.train, newdata=new.model.validation, type="response")
+pred.landslide.new = predict(fit.new.model.train, newdata=new.model.validation, 
+                             type="response")
 
 thr.val.new <- ifelse(pred.landslide.new >= 0.5, 1, 0)
 
@@ -584,3 +595,206 @@ auc(new.Roc)
 **As a thumb rule, we have an excellent classifier if AUC is >=0.9 and a good classifier when it's >= 0.8.**\
 **The AUC of my new model is 0.83, it means there is 83% chance that the model will be able to distinguish between positives class and negative class, and it is a good classifier.** 
 
+
+# 6.Predict the logistic response (susceptibility of landslide) for a specific site
+```{r}
+fit.model =glm(formula = lslpts ~ slope +
+                       cplan + cprof + elev + log10_carea,
+                     family = binomial('logit'), data = landslide.train) 
+
+newdata = data.frame(slope=50.15,cplan=0.0028,cprof=0.008, elev=2000,log10_carea=3.202)
+
+predict.new = predict(fit.model,newdata, type="response")
+
+fit.model$coefficients
+thr.val <- ifelse(predict.new >= 0.5, print("landslide"), print("no landslide"))
+```
+
+## Comments:  
+* With the threshold of 0.5, the prediction of the landslide at new site would be negative.
+
+# 7.Quantifying parameter uncertainty with the bootstrap method  
+* Parameter uncertainty can be obtained by itteratively fitting a model to a new bootstrap sample numerous times.  
+* The joint distribution of fitted coefficients generated from the bootstrap samples is a measure of model parameter uncertainty.  
+
+## 7.a Quantifying parameter uncertainty
+```{r}
+boot.strap = function(landslide.train){
+  bootsample = list()
+  coef.bootsample = list()
+  coef.boot = data.frame()
+  for (i in 1:1000) {
+    bootsample[[i]] = 
+    landslide.train[sample(1:nrow(landslide.train),
+                           size = nrow(landslide.train),replace = T),]
+    coef.bootsample[[i]] = data.frame(t(coefficients(glm(formula = lslpts ~ slope +
+                       cplan + cprof + elev + log10_carea,
+                     family = binomial('logit'), data = bootsample[[i]]))))
+    coef.boot = rbind(coef.boot,coef.bootsample[[i]])
+  }
+  return(coef.boot)
+}
+
+boot.sum <- sapply(boot.strap(landslide.train),function(x) 
+  list(mean=format(mean(x),nsmall = 3), sd=format(sd(x),nsmall = 3)))
+
+boot.strap.data <- boot.strap(landslide.train)
+kable(boot.sum,caption = "Descriptive Statistics of Bootstrap")
+
+pal <-  wes_palette("FantasticFox1",n = 300, type = "continuous")
+density.boot <-ggplot(boot.strap.data, aes(x= slope, y=log10_carea)) + 
+  stat_density2d(aes(fill=..level..,alpha=..level..),
+                 bins=20,geom='polygon',colour='black') + 
+  scale_fill_gradientn(colours = pal)+
+  guides(alpha="none") +
+  geom_point(size = 0.8, alpha = 0.7) + 
+  theme_bw()
+
+chart.Correlation(boot.strap.data, histogram=TRUE, pch=19)
+density.boot
+```
+
+## Comments:  
+* Compared with the fitted coefficients from previous/orginal model, the mean values of each bootstrap coefficients in this section did change, showing the uncertainty of each of the parameters in this model.  
+* The level of the geom_density_2d plot is the height at which the 3D "mountains" were sliced while the "height" means the density (the joint distribution in this case), and central region contains the highest density. From the plot we may infer that the region that slope is between 0.10 and 0.15 and log10_carea is between -2.5 and -1.5 contains the highest probability mass, generally meaning that this region contains most of the points (sites).  
+
+## 7.b Prediction uncertainty due to parameter uncertainty
+```{r}
+predict.boot.fun = function(landslide.train){
+  bootsample = list()
+  fit.boot = list()
+  predict.boot = data.frame()
+  for (i in 1:1000) {
+    bootsample[[i]] = 
+    landslide.train[sample(1:nrow(landslide.train),
+                           size = nrow(landslide.train),replace = T),]
+    fit.boot[[i]] = glm(formula = lslpts ~ slope +
+                       cplan + cprof + elev + log10_carea,
+                     family = binomial('logit'), data = bootsample[[i]])
+    predict.boot = data.frame(rbind(predict.boot,
+                                    predict(fit.boot[[i]],newdata, type="response")))
+  }
+  return(predict.boot)
+}
+
+predict.data <-data.frame(predict.boot.fun(landslide.train))
+colnames(predict.data) <- c("predict_value")
+
+his.boot <- ggplot(data=predict.data, aes(x=predict_value))+
+  geom_histogram(binwidth=0.03,color="black",
+                 fill = "#E3E36A",alpha = 0.6)+
+  theme_bw()+
+  ggtitle("Histogram of Predicted Responese")+
+  geom_vline(xintercept = predict.new, color = "#353866",
+             linetype=4, size=1.3)+
+  geom_text(aes(x=predict.new, label="original predicted response", y=50), 
+            colour="black", angle=0, vjust = 1)+
+  xlab("predict response")
+
+his.boot
+mean(predict.data <0.5)
+```
+
+## Comments:  
+* The threshold of landslide has been set at 0.5 and in this section with the computed susceptibilities of landslide for new site by 1000 bootstramp samples, we have *68% of times* predicting it (predict as no-landslide) *right*.  
+
+# 8.Uncertainty propagation combining input and parameter uncertaintie  
+* Assume that the measurements at the interested site are uncertain, but the training data have no measurement uncertainty  
+* Conduct Monte Carlo simulation  
+```{r}
+uncertainty= function(landslide.train){
+  bootsample = list()
+  fit.boot = list()
+  predict.boot = data.frame()
+  for (i in 1:1200) {
+    newdata[[i]] = data.frame(slope=50.15 + rnorm(1,0,5),
+                   cplan=0.0028 +rnorm(1,0,0.01),
+                   cprof=0.008 + rnorm(1,0,0.005), 
+                   elev=2000 + rnorm(1,0,0),
+                   log10_carea=3.202 + rnorm(1,0,0.25))
+    bootsample[[i]] = 
+    landslide.train[sample(1:nrow(landslide.train),size = nrow(landslide.train),replace = T),]
+    fit.boot[[i]] = glm(formula = lslpts ~ slope +
+                       cplan + cprof + elev + log10_carea,
+                     family = binomial('logit'), data = bootsample[[i]])
+    predict.boot = data.frame(rbind(predict.boot,
+                                    predict(fit.boot[[i]],newdata[[i]], type="response")))
+  }
+  return(predict.boot)
+}
+
+predict.uncertainty <-data.frame(uncertainty(landslide.train))
+colnames(predict.uncertainty) <- c("predict_uncertainty")
+colnames(predict.data) <- c("predict_uncertainty")
+
+type.name<-t(cbind(t(rep("un.parameter",1000)),t(rep("uncertainty",1200))))
+colnames(type.name) <- c("type.name")
+
+predict.all <-rbind(predict.data,predict.uncertainty) %>%
+  cbind(type.name)
+
+plot.all<- ggplot(data=predict.all) +
+  geom_histogram(aes(x=predict_uncertainty,fill =type.name),
+                 binwidth=0.05, col ="black",alpha = 0.6) +
+  scale_fill_manual(values = wes_palette("GrandBudapest2", n = 3))+
+  theme_bw()+
+    ggtitle("Histogram of Predicted Responese")+
+  geom_vline(xintercept = predict.new, color = "#353866",
+             linetype=4, size=1.3)+
+  geom_text(aes(x=predict.new, label="original predicted response", y=250), 
+            colour="black", angle=0, vjust = 1)+
+  xlab("predict responese")
+plot.all
+
+mean(predict.uncertainty<0.5)
+
+```
+
+## Comments:  
+* Compared with the histogram *accounting only for uncertainty in model parameters*, the histogram *accounting for uncertainty in both input variables and model coefficient* has higher variance, indicating that its predicted response has higher uncertainty.  
+However, the mean values of these two are approximatelty the same and, with the computed susceptibilities of landslide for new site by 1200 bootstramp samples (uncertainty in both input variables and model coefficient), we have *58.92% of times* predicting it (predict as no-landslide) *right*.   
+
+# 9.Spatial Prediction and Mapping
+## 9.a Computation of terrain variables
+```{r}
+aspect_ratio = terrain(ta$elev, opt = "aspect")
+slope_ratio = terrain((ta$slope)*pi/180, opt = "slope")
+hill <- hillShade(slope_ratio, aspect_ratio)
+plot(hill, col=grey(0:100/100), legend=TRUE, main='hillshade map')
+```
+
+## 9.b Spatial prediction
+```{r}
+plot(hill, col=grey(0:100/100), 
+     legend=FALSE,
+     main='landslide susceptibility with hillshade map')
+plot(predict(ta,fit.model,type="response"),
+     col = c("#006400","#556B2F","#6B8E23","#808000",
+             "#FFD700","#FFA500","#FF4500",
+             "#DC143C","#B22222","#8B0000"),
+     breaks = seq(0,1,by = 0.1),
+     add=T)
+```
+
+## 9.c Decision making
+* Choose a new site (dev_coordinate) to evaluate its landslide susceptibility and visualize the risk at this site  
+```{r}
+dev_coordinate = data.frame(x=714717.7, y=9560497)
+dev_data <- data.frame(raster::extract(ta,dev_coordinate))
+dev_predict <- predict(fit.model,dev_data, type="response")
+
+plot(predict(ta,fit.model,type="response"),
+     col = c("#006400","#556B2F","#6B8E23","#808000",
+             "#FFD700","#FFA500","#FF4500",
+             "#DC143C","#B22222","#8B0000"),
+     breaks = seq(0,1,by = 0.1))
+points(dev_coordinate, pch=1, cex=5, col="white")
+text(dev_coordinate, labels = "site of interest", cex = .8, 
+     col="white")
+
+dev_predict
+thr.val <- ifelse(dev_predict >= 0.5, print("landslide"), print("no landslide"))
+```
+
+## Comments:  
+* The landslide susceptibility of this site is 0.125 and, if we set the threshold as 0.5, then the response indicates that the prediction of landslide is negative. The susceptibility that has been calculated is the probability of landslide occurance, however, the risk of a landslides also depends on its negatively impact on individuals, assets, and/or the environment, which is also uncertain. The uncertain of landslides' negatively impacts in this context may stem from lack of knowledge (e.g.:population density of the interested site) etc., and this can be refered as the epistemic uncertainty.
