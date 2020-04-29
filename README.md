@@ -1,1 +1,1 @@
-# Logistic-Regression-for-Landslide-Occurance-Prediction
+# Logistic Regression for Landslide Occurance Prediction
